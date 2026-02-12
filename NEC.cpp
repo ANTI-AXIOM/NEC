@@ -22,115 +22,243 @@
 //                                                                                                                                   //
 /*************************************************************************************************************************************/
 
-// inclusion des fichiers header des bibliothèques de fonctions Arduino
-#include <stdint.h>
-#include <stdbool.h>
-#include <arduino.h>
 #include "NEC.h"
 
-// definition des fonctions assembly
-void asmDelay(uint32_t cycles) {
-  // nous utilisons une boucle en assembleur car l'assembleur est plus rapide que le C++ pour faire des boucles
-  // la boucle est volatile car nous utilisons des registres qui ne sont pas censees etre utilisees par le compilateur
-  // nous utilisons l'instruction "sbis" (skip if bit in I/O register set) pour
-  // attendre que le registre de n bits passe de la valeur 'cycles' a 0
-  // nous utilisons l'instruction "brne" (branch if not equal) pour reboucler
-  // sur la premiere instruction de la boucle tant que le registre n'est pas égal a 0
-  register uint32_t i = 0;
-  __asm__ __volatile__ ( 
-    "1: sbiw %0, 1\n\t"             // decremente le registre de n bits (2 clk cycles par itération)
-    "brne 1b"                       // le registre de n bits est stocké dans la variable i
-    : "=w" (i)                      // le registre de n bits est initialisé a 'cycles'
-    : "0" (cycles)                  // temps d'execution = ('cycles' itérations * 4 clk cycles) - 1/(16 * 10^6 Hz)
-  );
+// =================================================================================
+// Utilitaires ASM & Timing
+// =================================================================================
+
+// Délai précis en assembleur (pour AVR 16MHz)
+// 1 cycle = 1/16 µs = 62.5ns
+// La boucle prend 4 cycles.
+static inline void asmDelay(uint32_t cycles) {
+    if (cycles == 0) return;
+#ifdef __AVR__
+    __asm__ __volatile__ (
+        "1: sbiw %0, 1\n\t" // 2 cycles
+        "brne 1b"           // 2 cycles (sauf dernier passage 1 cycle)
+        : "=w" (cycles)
+        : "0" (cycles)
+    );
+#else
+    // Fallback simulation (approximatif)
+    // Simple boucle volatile pour éviter l'overhead de chrono
+    // Calibrage: multiplier par une constante
+    // 50 -> 1.6ms.
+    // 280 -> 1.7ms (optimisé ?)
+    // Essai avec NOP et facteur 2000
+    volatile uint32_t count = cycles * 2000; 
+    while (count--) {
+        __asm__ __volatile__("nop");
+    }
+#endif
 }
 
-// definition des fonctions d'emission de la bibliotheque NEC
-void GenererTrameNEC(int Broche, uint8_t Adresse, uint8_t Donnee) {// GenererTrameNEC : fonction d'action
-  register uint32_t trame = (Adresse << 24) | (~Adresse << 16) | (Donnee << 8) | ~Donnee & 0xFF; // register pour booster la vitesse
-  GenererBurstNEC(Broche, 342);       // generation du header (en-tête) NEC
-  asmDelay(18000);                    // temps a l'état bas apres entête du protocole NEC : (18000 itérations * 4 clk cycles) - 1/(16 * 10^6 Hz) = 4.4999375 ms
-  for (uint8_t i = 0; i < 32; ++i) {
-    GenererBurstNEC(Broche, 21);
-    asmDelay((trame >> (31 - i)) & 1 ? 6748 : 2248); // (6748 itérations * 4 clk cycles) - 1/(16 * 10^6 Hz) = 1686.9375 µs pour 1
-  }                                                  // (2248 itérations * 4 clk cycles) - 1/(16 * 10^6 Hz) = 561.9375 µs pour 0
-  GenererBurstNEC(Broche, 21);        // burst final d'une trame NEC
-  asmDelay(162000);                   // delai inter-trame de (162000 * 4) - 1 / (16 * 10^6 Hz) = 40.4999375 ms
+// =================================================================================
+// Classe NecTx (Emission)
+// =================================================================================
+
+NecTx::NecTx(uint8_t pin) : _pin(pin), _portReg(nullptr), _pinMask(0) {}
+
+void NecTx::begin() {
+    pinMode(_pin, OUTPUT);
+    digitalWrite(_pin, LOW);
+
+    // Port Caching : On récupère l'adresse du registre PORT et le masque binaire
+    // Cela évite l'appel coûteux à digitalPinToPort/digitalWrite dans la boucle 38kHz
+    uint8_t port = digitalPinToPort(_pin);
+    _pinMask = digitalPinToBitMask(_pin);
+    _portReg = portOutputRegister(port);
 }
 
-void GenererBurstNEC(int Broche, uint16_t pulses) { // GenererBurstNEC : fonction d'action
-  for (register uint16_t i = 0; i < pulses; i++) {
-    GenererImpulsion38kHzNEC(Broche); // generation de l'impulsion du protocole NEC
-  }
+void NecTx::sendBurst(uint16_t durationMicroseconds) {
+    // Calcul du nombre de cycles 38kHz (Période ~26.3µs)
+    // 1000 µs / 26.3 µs ~= 38 cycles par ms environ
+    // Plus précisément : duration / 26.315...
+    uint32_t pulses = (durationMicroseconds * 38) / 1000;
+    
+    // Debug Macros
+#ifdef NEC_DEBUG
+    #include <stdio.h>
+    #define NEC_LOG(...) do { printf("[NEC] " __VA_ARGS__); printf("\n"); fflush(stdout); } while(0)
+#else
+    #define NEC_LOG(...)
+#endif
+    // Debug timing for simulation
+    #ifdef NEC_DEBUG
+    uint32_t start = micros();
+    NEC_LOG("sendBurst requested: %u us, pulses: %lu", durationMicroseconds, pulses);
+    #endif
+
+    // Pour 38kHz, période = 26µs. 
+    // On doit faire : ON (~8µs) -> OFF (~18µs) (Duty cycle 1/3 souvent utilisé, ou 50%)
+    // Ici on vise ~50% pour simplifier ou rester proche de l'original.
+    
+    // Optimisation CRITIQUE : Désactivation des interruptions pour timing parfait
+    // Attention : CLI / SEI
+    
+    while (pulses-- > 0) {
+        // ON
+        *_portReg |= _pinMask; 
+        asmDelay(35); // ~9µs
+        
+        // OFF
+        *_portReg &= ~_pinMask;
+        asmDelay(70); // ~17.5µs
+    }
+    
+    #ifdef NEC_DEBUG
+    uint32_t elapsed = micros() - start;
+    NEC_LOG("sendBurst(%u) took %lu us", durationMicroseconds, (unsigned long)elapsed);
+    #endif
 }
 
-void GenererImpulsion38kHzNEC(int Broche) { // GenererImpulsion38kHzNEC : fonction d'action
-  controlerDiodeIR(Broche, true);
-  asmDelay(35); // temps a l'etat haut apres l'impulsion du protocole NEC : (35 itérations * 4 clk cycles) - 1/(16 * 10^6 Hz) = 8.6875 µs
-  controlerDiodeIR(Broche, false);
-  asmDelay(71); // temps a l'etat bas apres l'impulsion du protocole NEC : (71 itérations * 4 clk cycles) - 1/(16 * 10^6 Hz) = 17.6875 µs
+void NecTx::sendSpace(uint16_t durationMicroseconds) {
+    // Espace = silence (LED éteinte)
+    *_portReg &= ~_pinMask;
+    // On utilise delayMicroseconds pour les temps longs, c'est précis.
+    // Mais pour garantir la stabilité, on reste en mode "interruptions désactivées" si appelé depuis send().
+    if (durationMicroseconds > 0) {
+        delayMicroseconds(durationMicroseconds);
+    }
 }
 
-inline void controlerDiodeIR(int Broche, bool etat) { // controlerDiodeIR : fonction d'action
-  if (Broche >= 0 && Broche <= 7)                                         // la broche doit etre comprise entre 0 et 7
-      PORTD = (PORTD & ~(1 << Broche)) | (etat << Broche);                // on change l'etat de la broche
-  if (Broche >= 8 && Broche <= 13)                                        // la broche doit etre comprise entre 8 et 13
-      PORTB = (PORTB & ~(1 << (Broche - 8))) | (etat << (Broche - 8));    // on change l'etat de la broche
-  if (Broche >= A0 && Broche <= A5)                                       // la broche doit etre comprise entre A0 et A5
-      PORTC = (PORTC & ~(1 << (Broche - A0))) | (etat << (Broche - A0));  // on change l'etat de la broche
+void NecTx::send(uint8_t address, uint8_t command) {
+    // Préparation de la trame 32 bits : Address, ~Address, Command, ~Command
+    uint32_t data = ((uint32_t)address << 24) |
+                    ((uint32_t)(~address & 0xFF) << 16) |
+                    ((uint32_t)command << 8) |
+                    ((uint32_t)(~command & 0xFF));
+
+    // SECTION CRITIQUE : Désactivation des interruptions
+    noInterrupts();
+
+    // 1. Header
+    sendBurst(NecProtocol::HDR_MARK);
+    sendSpace(NecProtocol::HDR_SPACE);
+
+    // 2. Data
+    for (int i = 31; i >= 0; i--) {
+        sendBurst(NecProtocol::BIT_MARK);
+        if (data & (1UL << i)) {
+            sendSpace(NecProtocol::ONE_SPACE);
+        } else {
+            sendSpace(NecProtocol::ZERO_SPACE);
+        }
+    }
+
+    // 3. Bit de fin
+    sendBurst(NecProtocol::BIT_MARK);
+    
+    // Réactivation des interruptions
+    interrupts();
+    
+    // Délai de garde après transmission pour séparer les commandes
+    // Fait avec interruptions actives pour ne pas bloquer millis() trop longtemps
+    delay(40); 
 }
 
-// Définition des fonctions de reception de la bibliotheque NEC
-int8_t AcquerirTrameNEC(int Broche, uint8_t *ptr_Adresse, uint8_t *ptr_Donnee) { // AcquerirTrameNEC : fonction d'acquisition
-  int16_t octet = AcquerirOctetNEC(Broche);  // Acquisition de l'adresse
-  if (AcquerirEnteteNEC(Broche) < 0 || octet < 0 || AcquerirOctetNEC(Broche) != ~octet)
-    return -1;                               // Erreur de timing
-  *ptr_Adresse = octet;                      // Stockage de l'adresse
-  octet = AcquerirOctetNEC(Broche);          // Acquisition de la donnée
-  if (octet < 0 || AcquerirOctetNEC(Broche)  != ~octet || AcquerirFrontDescendantNEC(Broche) < 0)
-    return -1;                               // Erreur de timing
-  *ptr_Donnee = octet;                       // Stockage de la donnée
-  return 0;                                  // Trame correcte
+// =================================================================================
+// Classe NecRx (Réception)
+// =================================================================================
+
+NecRx::NecRx(uint8_t pin) : _pin(pin) {}
+
+void NecRx::begin() {
+    pinMode(_pin, INPUT);
 }
 
-int8_t AcquerirEnteteNEC(int Broche) {          // AcquerirEnteteNEC : fonction d'acquisition
-  int32_t t = AcquerirFrontNEC(Broche, true);   // Acquisition du front montant
-  if (t < 4050 || t > 4950) return -1;          // Controle de timing       4500us du protocole NEC (-/+10%)
-  t = AcquerirFrontNEC(Broche, false);          // Acquisition du front descendant
-  if (t < 8100 || t > 9900) return -1;          // Controle de timing       9000us du protocole NEC (-/+10%)
-  return 0;                                     // Entête correcte
+bool NecRx::available() {
+    // Le protocole NEC commence par un BURST (LED allumée).
+    // Les récepteurs IR (ex: TSOP4838) sont "Active LOW".
+    // Donc au repos = HIGH. Réception signal = LOW.
+    return (digitalRead(_pin) == LOW);
 }
 
-int16_t AcquerirOctetNEC(int Broche) { // AcquerirOctetNEC : fonction d'acquisition
-  uint8_t octet = 0;
-  for (uint8_t i = 7; i >= 0; i--) {     // boucle de construction de l'octet NEC
-    int32_t t = AcquerirFrontNEC(Broche, false);    // Acquisition du front descendant
-        if (t < 281 || t > 843) return -1;          // Erreur de timing
-        t = AcquerirFrontNEC(Broche, true);         // Acquisition du front montant
-        int8_t bit = (t > 1405 && t < 1967) ? 1 : (t > 281 && t < 843) ? 0 : -1; // Bit 1, 0 ou erreur de timing
-        if (bit < 0) return -1;                     // Erreur de timing
-        octet |= bit << i;                          // Construction de l'octet NEC
-  }
-  return octet;
+// Helper pour vérifier si une durée est dans la tolérance
+static bool isToleranceOk(uint32_t measured, uint32_t expected) {
+    uint32_t tolerance = (expected * NecProtocol::TOLERANCE_PERCENT) / 100;
+    return (measured >= (expected - tolerance)) && (measured <= (expected + tolerance));
 }
 
-int32_t AcquerirFrontNEC(int Broche, bool front) { // AcquerirFrontNEC: fonction d'acquisition
-  uint32_t t = micros();                         // Mesure du temps de front
-  while (AcquerirInfrarouge(Broche) != front) {  // Attente du front (montant: 1, descendant: 0)
-      if (micros() - t >= 500000)                // Test de timing
-          return -2;                             // Trame absente
-  }
-  int32_t dt = micros() - t;                     // Mesure du temps de front
-  return (dt < 200) ? -1 : dt;                   // Controle de timing
+// Fonction interne pour mesurer une impulsion
+// Retourne la durée en µs, ou 0 si timeout/erreur
+uint32_t NecRx::measurePulse(bool state, uint32_t timeout) {
+    uint32_t start = micros();
+    while (digitalRead(_pin) == state) {
+        if (micros() - start > timeout) {
+             NEC_LOG("measurePulse TIMEOUT! State=%d, Elapsed=%lu, Timeout=%lu", state, (unsigned long)(micros() - start), timeout);
+             return 0;
+        }
+    }
+    return micros() - start;
 }
 
-bool AcquerirInfrarouge(int Broche) {
-  bool out = 0;
-  if (Broche >= 0 && Broche <= 7)
-    out = PIND & (1 << Broche) ? 0 : 1;
-  if (Broche >= 8 && Broche <= 13)
-    out = PINB & (1 << (Broche - 8)) ? 0 : 1;
-  if (Broche >= A0 && Broche <= A5)
-    out = PINC & (1 << (Broche - A0)) ? 0 : 1;
-  return out;
+NecResult NecRx::read(uint8_t& address, uint8_t& command) {
+    // Attendre que la ligne passe LOW (début Header)
+    // Timeout rapide si appelé sans available()
+    if (digitalRead(_pin) == HIGH) return NecResult::NO_DATA;
+
+    // 1. HEADER MARK (9ms)
+    uint32_t duration = measurePulse(LOW, 12000); // Max 12ms pour 9ms
+    if (duration == 0 || !isToleranceOk(duration, NecProtocol::HDR_MARK)) {
+        NEC_LOG("Error: Header Mark timeout or bad duration (%lu)", duration);
+        return NecResult::TIMEOUT_HEADER;
+    }
+
+    // 2. HEADER SPACE (4.5ms)
+    duration = measurePulse(HIGH, 6000); // Max 6ms pour 4.5ms
+    if (duration == 0 || !isToleranceOk(duration, NecProtocol::HDR_SPACE)) {
+        NEC_LOG("Error: Header Space timeout or bad duration (%lu)", duration);
+        return NecResult::TIMEOUT_HEADER;
+    }
+
+    NEC_LOG("Header OK. Reading bits...");
+
+    // 3. Lecture des 32 bits
+    uint32_t rawData = 0;
+    for (int i = 0; i < 32; i++) {
+        // BIT MARK (562µs) - Doit être LOW
+        // On est large sur le timeout (1500µs) car on veut surtout mesurer le SPACE suivant
+        if (measurePulse(LOW, 1500) == 0) return NecResult::TIMEOUT_DATA;
+
+        // BIT SPACE (562µs ou 1687µs) - Doit être HIGH
+        duration = measurePulse(HIGH, 3000); // Max 3ms
+        if (duration == 0) return NecResult::TIMEOUT_DATA;
+
+        if (isToleranceOk(duration, NecProtocol::ONE_SPACE)) {
+            rawData |= (1UL << (31 - i));
+        } else if (isToleranceOk(duration, NecProtocol::ZERO_SPACE)) {
+            // C'est un 0
+        } else {
+            NEC_LOG("Error: Bad bit duration (%lu) at bit %d", duration, i);
+            return NecResult::ERROR_PROTOCOL; // Durée invalide
+        }
+    }
+
+    // 4. Bit de fin (Mark final)
+    if (measurePulse(LOW, 1000) == 0) return NecResult::TIMEOUT_DATA;
+
+    NEC_LOG("Raw Data: 0x%08lX", rawData);
+
+    // Décodage et vérification
+    uint8_t addr = (rawData >> 24) & 0xFF;
+    uint8_t invAddr = (rawData >> 16) & 0xFF;
+    uint8_t cmd = (rawData >> 8) & 0xFF;
+    uint8_t invCmd = rawData & 0xFF;
+
+    if ((uint8_t)(~addr) != invAddr) {
+        NEC_LOG("Error: Address Checksum fail (Addr: %02X, Inv: %02X)", addr, invAddr);
+        return NecResult::ERROR_PROTOCOL; // Erreur adresse
+    }
+    if ((uint8_t)(~cmd) != invCmd) {
+        NEC_LOG("Error: Command Checksum fail (Cmd: %02X, Inv: %02X)", cmd, invCmd);
+        return NecResult::ERROR_PROTOCOL;   // Erreur commande
+    }
+
+    address = addr;
+    command = cmd;
+    
+    NEC_LOG("Frame Validated.");
+    return NecResult::OK;
 }

@@ -23,18 +23,73 @@
 /*************************************************************************************************************************************/
 
 // inclusion des fichiers header des bibliothèques de fonctions Arduino
-#include <stdint.h>
-#include <stdbool.h>
-#include <arduino.h>
+#ifndef NEC_H
+#define NEC_H
 
-// declaration des fonctions de la bibliotheque NEC
-void asmDelay(uint32_t cycles);                                                   // sous-fonction d'une trame NEC utilisee par la fonction GenererTrameNEC & AcquerirTrameNEC
-void GenererTrameNEC(int Broche, uint8_t Adresse, uint8_t Donnee);                // fonction d'émission d'une trame NEC
-void GenererBurstNEC(int Broche, uint16_t pulses);                                // sous-fonction d'émission d'une trame NEC utilisee par la fonction GenererTrameNEC
-void GenererImpulsion38kHzNEC(int Broche);                                        // sous-fonction d'émission d'une trame NEC utilisee par la fonction GenererTrameNEC
-void controlerDiodeIR(int Broche, bool state);                                    // sous-fonction d'émission d'une trame NEC utilisee par la fonction GenererTrameNEC
-int8_t AcquerirTrameNEC(int Broche, uint8_t* Adresse, uint8_t* Donnee);           // fonction d'acquisition d'une trame NEC
-int8_t AcquerirEnteteNEC(int Broche);                                             // sous-fonction d'acquisition d'une trame NEC utilisee par la fonction AcquerirTrameNEC
-int16_t AcquerirOctetNEC(int Broche);                                             // sous-fonction d'acquisition d'une trame NEC utilisee par la fonction AcquerirTrameNEC
-int32_t AcquerirFrontNEC(int Broche, bool front);                                 // sous-fonction d'acquisition d'une trame NEC utilisee par la fonction AcquerirTrameNEC
-bool AcquerirInfrarouge(int Broche);                                              // sous-fonction d'acquisition d'une trame NEC utilisee par la fonction AcquerirTrameNEC
+#include <Arduino.h>
+
+// Définition des codes d'erreur
+enum class NecResult {
+    OK,
+    TIMEOUT_HEADER, // Pas d'entête détectée
+    TIMEOUT_DATA,   // Timeout pendant la lecture des données
+    ERROR_PROTOCOL, // Erreur de timing (hors tolérance)
+    NO_DATA         // Pas de signal détecté (pour available())
+};
+
+// Constantes du protocole NEC (en microsecondes)
+namespace NecProtocol {
+    constexpr uint16_t HDR_MARK = 9000;
+    constexpr uint16_t HDR_SPACE = 4500;
+    constexpr uint16_t BIT_MARK = 562;
+    constexpr uint16_t ONE_SPACE = 1687;
+    constexpr uint16_t ZERO_SPACE = 562;
+    // Tolérance de 20%
+    constexpr uint8_t TOLERANCE_PERCENT = 20; 
+}
+
+// Debug Macros
+#ifdef NEC_DEBUG
+    #include <stdio.h>
+    #define NEC_LOG(...) do { printf("[NEC] " __VA_ARGS__); printf("\n"); } while(0)
+#else
+    #define NEC_LOG(...)
+#endif
+
+// Classe pour l'émission (Optimisée AVR + Port Caching)
+class NecTx {
+private:
+    uint8_t _pin;
+    volatile uint8_t *_portReg;
+    uint8_t _pinMask;
+
+    void sendBurst(uint16_t durationMicroseconds);
+    void sendSpace(uint16_t durationMicroseconds);
+
+public:
+    NecTx(uint8_t pin);
+    void begin(); // Initialise le port caching
+    void send(uint8_t address, uint8_t command);
+};
+
+// Classe pour la réception (Tolérante et Non-bloquante)
+class NecRx {
+private:
+    uint8_t _pin;
+
+    // Fonction interne pour mesurer une impulsion (niveau HAUT ou BAS)
+    // Retourne 0 si timeout ou erreur, sinon la durée
+    uint32_t measurePulse(bool state, uint32_t timeout);
+
+public:
+    NecRx(uint8_t pin);
+    void begin();
+    
+    // Vérifie si une trame semble commencer (non bloquant)
+    bool available(); 
+    
+    // Lit une trame complète (bloquant avec timeout)
+    NecResult read(uint8_t& address, uint8_t& command);
+};
+
+#endif // NEC_H

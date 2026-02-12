@@ -1,0 +1,11 @@
+In file included from NEC_Simulator.cpp:27:
+../NEC.cpp: In member function 'NecResult NecRx::read(uint8_t&, uint8_t&)':
+../NEC.cpp:174:27: error: 'isToleranceOk' was not declared in this scope
+  174 |     if (duration == 0 || !isToleranceOk(duration, NecProtocol::HDR_MARK))
+      |                           ^~~~~~~~~~~~~
+../NEC.cpp:179:27: error: 'isToleranceOk' was not declared in this scope
+  179 |     if (duration == 0 || !isToleranceOk(duration, NecProtocol::HDR_SPACE))
+      |                           ^~~~~~~~~~~~~
+../NEC.cpp:193:13: error: 'isToleranceOk' was not declared in this scope
+  193 |         if (isToleranceOk(duration, NecProtocol::ONE_SPACE)) {
+      |             ^~~~~~~~~~~~~
